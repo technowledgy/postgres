@@ -1,0 +1,1534 @@
+From 9e98716a6d194eca6a14c36eb1046f947042f206 Mon Sep 17 00:00:00 2001
+From: Dean Rasheed <dean.a.rasheed@gmail.com>
+Date: Tue, 22 Mar 2022 10:28:10 +0000
+Subject: [PATCH] Add support for security invoker views.
+
+A security invoker view checks permissions for accessing its
+underlying base relations using the privileges of the user of the
+view, rather than the privileges of the view owner. Additionally, if
+any of the base relations are tables with RLS enabled, the policies of
+the user of the view are applied, rather than those of the view owner.
+
+This allows views to be defined without giving away additional
+privileges on the underlying base relations, and matches a similar
+feature available in other database systems.
+
+It also allows views to operate more naturally with RLS, without
+affecting the assignments of policies to users.
+
+Christoph Heiss, with some additional hacking by me. Reviewed by
+Laurenz Albe and Wolfgang Walther.
+
+Discussion: https://postgr.es/m/b66dd6d6-ad3e-c6f2-8b90-47be773da240%40cybertec.at
+---
+ src/backend/access/common/reloptions.c        |  11 +
+ src/backend/commands/lockcmds.c               |  19 +-
+ src/backend/rewrite/rewriteHandler.c          |  18 +-
+ src/backend/utils/cache/relcache.c            |  73 +++--
+ src/include/utils/rel.h                       |  11 +
+ src/test/regress/expected/create_view.out     |  46 +++-
+ src/test/regress/expected/lock.out            |  66 +++++
+ src/test/regress/expected/rowsecurity.out     | 257 +++++++++++++++++-
+ src/test/regress/expected/rules.out           |  30 ++
+ src/test/regress/expected/updatable_views.out | 237 ++++++++++++++++
+ src/test/regress/sql/create_view.sql          |  22 +-
+ src/test/regress/sql/lock.sql                 |  49 ++++
+ src/test/regress/sql/rowsecurity.sql          | 122 +++++++++
+ src/test/regress/sql/rules.sql                |  28 ++
+ src/test/regress/sql/updatable_views.sql      | 180 ++++++++++++
+ 20 files changed, 1239 insertions(+), 75 deletions(-)
+
+diff --git a/src/backend/access/common/reloptions.c b/src/backend/access/common/reloptions.c
+index b5602f5323..1186e4ab7d 100644
+--- a/src/backend/access/common/reloptions.c
++++ b/src/backend/access/common/reloptions.c
+@@ -140,6 +140,15 @@ static relopt_bool boolRelOpts[] =
+ 		},
+ 		false
+ 	},
++	{
++		{
++			"security_invoker",
++			"Privileges on underlying relations are checked as the invoking user, not the view owner",
++			RELOPT_KIND_VIEW,
++			AccessExclusiveLock
++		},
++		false
++	},
+ 	{
+ 		{
+ 			"vacuum_truncate",
+@@ -1996,6 +2005,8 @@ view_reloptions(Datum reloptions, bool validate)
+ 	static const relopt_parse_elt tab[] = {
+ 		{"security_barrier", RELOPT_TYPE_BOOL,
+ 		offsetof(ViewOptions, security_barrier)},
++		{"security_invoker", RELOPT_TYPE_BOOL,
++		offsetof(ViewOptions, security_invoker)},
+ 		{"check_option", RELOPT_TYPE_ENUM,
+ 		offsetof(ViewOptions, check_option)}
+ 	};
+diff --git a/src/backend/commands/lockcmds.c b/src/backend/commands/lockcmds.c
+index 34f2270ced..2fd55af0e8 100644
+--- a/src/backend/commands/lockcmds.c
++++ b/src/backend/commands/lockcmds.c
+@@ -168,7 +168,7 @@ typedef struct
+ {
+ 	LOCKMODE	lockmode;		/* lock mode to use */
+ 	bool		nowait;			/* no wait mode */
+-	Oid			viewowner;		/* view owner for checking the privilege */
++	Oid			check_as_user;	/* user for checking the privilege */
+ 	Oid			viewoid;		/* OID of the view to be locked */
+ 	List	   *ancestor_views; /* OIDs of ancestor views */
+ } LockViewRecurse_context;
+@@ -214,8 +214,12 @@ LockViewRecurse_walker(Node *node, LockViewRecurse_context *context)
+ 			if (list_member_oid(context->ancestor_views, relid))
+ 				continue;
+ 
+-			/* Check permissions with the view owner's privilege. */
+-			aclresult = LockTableAclCheck(relid, context->lockmode, context->viewowner);
++			/*
++			 * Check permissions as the specified user.  This will either be
++			 * the view owner or the current user.
++			 */
++			aclresult = LockTableAclCheck(relid, context->lockmode,
++										  context->check_as_user);
+ 			if (aclresult != ACLCHECK_OK)
+ 				aclcheck_error(aclresult, get_relkind_objtype(relkind), relname);
+ 
+@@ -258,9 +262,16 @@ LockViewRecurse(Oid reloid, LOCKMODE lockmode, bool nowait,
+ 	view = table_open(reloid, NoLock);
+ 	viewquery = get_view_query(view);
+ 
++	/*
++	 * If the view has the security_invoker property set, check permissions as
++	 * the current user.  Otherwise, check permissions as the view owner.
++	 */
+ 	context.lockmode = lockmode;
+ 	context.nowait = nowait;
+-	context.viewowner = view->rd_rel->relowner;
++	if (RelationHasSecurityInvoker(view))
++		context.check_as_user = GetUserId();
++	else
++		context.check_as_user = view->rd_rel->relowner;
+ 	context.viewoid = reloid;
+ 	context.ancestor_views = lappend_oid(ancestor_views, reloid);
+ 
+diff --git a/src/backend/rewrite/rewriteHandler.c b/src/backend/rewrite/rewriteHandler.c
+index 9521e81100..be5c41b20c 100644
+--- a/src/backend/rewrite/rewriteHandler.c
++++ b/src/backend/rewrite/rewriteHandler.c
+@@ -3242,18 +3242,24 @@ rewriteTargetView(Query *parsetree, Relation view)
+ 				   0);
+ 
+ 	/*
+-	 * Mark the new target RTE for the permissions checks that we want to
+-	 * enforce against the view owner, as distinct from the query caller.  At
+-	 * the relation level, require the same INSERT/UPDATE/DELETE permissions
+-	 * that the query caller needs against the view.  We drop the ACL_SELECT
+-	 * bit that is presumably in new_rte->requiredPerms initially.
++	 * If the view has "security_invoker" set, mark the new target RTE for the
++	 * permissions checks that we want to enforce against the query caller.
++	 * Otherwise we want to enforce them against the view owner.
++	 *
++	 * At the relation level, require the same INSERT/UPDATE/DELETE
++	 * permissions that the query caller needs against the view.  We drop the
++	 * ACL_SELECT bit that is presumably in new_rte->requiredPerms initially.
+ 	 *
+ 	 * Note: the original view RTE remains in the query's rangetable list.
+ 	 * Although it will be unused in the query plan, we need it there so that
+ 	 * the executor still performs appropriate permissions checks for the
+ 	 * query caller's use of the view.
+ 	 */
+-	new_rte->checkAsUser = view->rd_rel->relowner;
++	if (RelationHasSecurityInvoker(view))
++		new_rte->checkAsUser = InvalidOid;
++	else
++		new_rte->checkAsUser = view->rd_rel->relowner;
++
+ 	new_rte->requiredPerms = view_rte->requiredPerms;
+ 
+ 	/*
+diff --git a/src/backend/utils/cache/relcache.c b/src/backend/utils/cache/relcache.c
+index b54c911766..a7b6c84028 100644
+--- a/src/backend/utils/cache/relcache.c
++++ b/src/backend/utils/cache/relcache.c
+@@ -721,6 +721,8 @@ RelationBuildTupleDesc(Relation relation)
+  * entry, because that keeps the update logic in RelationClearRelation()
+  * manageable.  The other subsidiary data structures are simple enough
+  * to be easy to free explicitly, anyway.
++ *
++ * Note: The relation's reloptions must have been extracted first.
+  */
+ static void
+ RelationBuildRuleLock(Relation relation)
+@@ -786,6 +788,7 @@ RelationBuildRuleLock(Relation relation)
+ 		Datum		rule_datum;
+ 		char	   *rule_str;
+ 		RewriteRule *rule;
++		Oid			check_as_user;
+ 
+ 		rule = (RewriteRule *) MemoryContextAlloc(rulescxt,
+ 												  sizeof(RewriteRule));
+@@ -825,10 +828,23 @@ RelationBuildRuleLock(Relation relation)
+ 		pfree(rule_str);
+ 
+ 		/*
+-		 * We want the rule's table references to be checked as though by the
+-		 * table owner, not the user referencing the rule.  Therefore, scan
+-		 * through the rule's actions and set the checkAsUser field on all
+-		 * rtable entries.  We have to look at the qual as well, in case it
++		 * If this is a SELECT rule defining a view, and the view has
++		 * "security_invoker" set, we must perform all permissions checks on
++		 * relations referred to by the rule as the invoking user.
++		 *
++		 * In all other cases (including non-SELECT rules on security invoker
++		 * views), perform the permissions checks as the relation owner.
++		 */
++		if (rule->event == CMD_SELECT &&
++			relation->rd_rel->relkind == RELKIND_VIEW &&
++			RelationHasSecurityInvoker(relation))
++			check_as_user = InvalidOid;
++		else
++			check_as_user = relation->rd_rel->relowner;
++
++		/*
++		 * Scan through the rule's actions and set the checkAsUser field on
++		 * all rtable entries. We have to look at the qual as well, in case it
+ 		 * contains sublinks.
+ 		 *
+ 		 * The reason for doing this when the rule is loaded, rather than when
+@@ -837,8 +853,8 @@ RelationBuildRuleLock(Relation relation)
+ 		 * the rule tree during load is relatively cheap (compared to
+ 		 * constructing it in the first place), so we do it here.
+ 		 */
+-		setRuleCheckAsUser((Node *) rule->actions, relation->rd_rel->relowner);
+-		setRuleCheckAsUser(rule->qual, relation->rd_rel->relowner);
++		setRuleCheckAsUser((Node *) rule->actions, check_as_user);
++		setRuleCheckAsUser(rule->qual, check_as_user);
+ 
+ 		if (numlocks >= maxlocks)
+ 		{
+@@ -1163,27 +1179,6 @@ retry:
+ 	 */
+ 	RelationBuildTupleDesc(relation);
+ 
+-	/*
+-	 * Fetch rules and triggers that affect this relation
+-	 */
+-	if (relation->rd_rel->relhasrules)
+-		RelationBuildRuleLock(relation);
+-	else
+-	{
+-		relation->rd_rules = NULL;
+-		relation->rd_rulescxt = NULL;
+-	}
+-
+-	if (relation->rd_rel->relhastriggers)
+-		RelationBuildTriggers(relation);
+-	else
+-		relation->trigdesc = NULL;
+-
+-	if (relation->rd_rel->relrowsecurity)
+-		RelationBuildRowSecurity(relation);
+-	else
+-		relation->rd_rsdesc = NULL;
+-
+ 	/* foreign key data is not loaded till asked for */
+ 	relation->rd_fkeylist = NIL;
+ 	relation->rd_fkeyvalid = false;
+@@ -1231,6 +1226,30 @@ retry:
+ 	/* extract reloptions if any */
+ 	RelationParseRelOptions(relation, pg_class_tuple);
+ 
++	/*
++	 * Fetch rules and triggers that affect this relation.
++	 *
++	 * Note that RelationBuildRuleLock() relies on this being done after
++	 * extracting the relation's reloptions.
++	 */
++	if (relation->rd_rel->relhasrules)
++		RelationBuildRuleLock(relation);
++	else
++	{
++		relation->rd_rules = NULL;
++		relation->rd_rulescxt = NULL;
++	}
++
++	if (relation->rd_rel->relhastriggers)
++		RelationBuildTriggers(relation);
++	else
++		relation->trigdesc = NULL;
++
++	if (relation->rd_rel->relrowsecurity)
++		RelationBuildRowSecurity(relation);
++	else
++		relation->rd_rsdesc = NULL;
++
+ 	/*
+ 	 * initialize the relation lock manager information
+ 	 */
+diff --git a/src/include/utils/rel.h b/src/include/utils/rel.h
+index 77d176a934..ccd6fefc54 100644
+--- a/src/include/utils/rel.h
++++ b/src/include/utils/rel.h
+@@ -397,6 +397,7 @@ typedef struct ViewOptions
+ {
+ 	int32		vl_len_;		/* varlena header (do not touch directly!) */
+ 	bool		security_barrier;
++	bool		security_invoker;
+ 	ViewOptCheckOption check_option;
+ } ViewOptions;
+ 
+@@ -410,6 +411,16 @@ typedef struct ViewOptions
+ 	 (relation)->rd_options ?												\
+ 	  ((ViewOptions *) (relation)->rd_options)->security_barrier : false)
+ 
++/*
++ * RelationHasSecurityInvoker
++ *		Returns true if the relation has the security_invoker property set.
++ *		Note multiple eval of argument!
++ */
++#define RelationHasSecurityInvoker(relation)								\
++	(AssertMacro(relation->rd_rel->relkind == RELKIND_VIEW),				\
++	 (relation)->rd_options ?												\
++	  ((ViewOptions *) (relation)->rd_options)->security_invoker : false)
++
+ /*
+  * RelationHasCheckOption
+  *		Returns true if the relation is a view defined with either the local
+diff --git a/src/test/regress/expected/create_view.out b/src/test/regress/expected/create_view.out
+index 509e930fc7..611475f1c2 100644
+--- a/src/test/regress/expected/create_view.out
++++ b/src/test/regress/expected/create_view.out
+@@ -267,17 +267,31 @@ ERROR:  invalid value for boolean option "security_barrier": 100
+ CREATE VIEW mysecview6 WITH (invalid_option)		-- Error
+        AS SELECT * FROM tbl1 WHERE a < 100;
+ ERROR:  unrecognized parameter "invalid_option"
++CREATE VIEW mysecview7 WITH (security_invoker=true)
++       AS SELECT * FROM tbl1 WHERE a = 100;
++CREATE VIEW mysecview8 WITH (security_invoker=false, security_barrier=true)
++       AS SELECT * FROM tbl1 WHERE a > 100;
++CREATE VIEW mysecview9 WITH (security_invoker)
++       AS SELECT * FROM tbl1 WHERE a < 100;
++CREATE VIEW mysecview10 WITH (security_invoker=100)	-- Error
++       AS SELECT * FROM tbl1 WHERE a <> 100;
++ERROR:  invalid value for boolean option "security_invoker": 100
+ SELECT relname, relkind, reloptions FROM pg_class
+        WHERE oid in ('mysecview1'::regclass, 'mysecview2'::regclass,
+-                     'mysecview3'::regclass, 'mysecview4'::regclass)
++                     'mysecview3'::regclass, 'mysecview4'::regclass,
++                     'mysecview7'::regclass, 'mysecview8'::regclass,
++                     'mysecview9'::regclass)
+        ORDER BY relname;
+-  relname   | relkind |        reloptions        
+-------------+---------+--------------------------
++  relname   | relkind |                   reloptions                   
++------------+---------+------------------------------------------------
+  mysecview1 | v       | 
+  mysecview2 | v       | {security_barrier=true}
+  mysecview3 | v       | {security_barrier=false}
+  mysecview4 | v       | {security_barrier=true}
+-(4 rows)
++ mysecview7 | v       | {security_invoker=true}
++ mysecview8 | v       | {security_invoker=false,security_barrier=true}
++ mysecview9 | v       | {security_invoker=true}
++(7 rows)
+ 
+ CREATE OR REPLACE VIEW mysecview1
+        AS SELECT * FROM tbl1 WHERE a = 256;
+@@ -287,17 +301,28 @@ CREATE OR REPLACE VIEW mysecview3 WITH (security_barrier=true)
+        AS SELECT * FROM tbl1 WHERE a < 256;
+ CREATE OR REPLACE VIEW mysecview4 WITH (security_barrier=false)
+        AS SELECT * FROM tbl1 WHERE a <> 256;
++CREATE OR REPLACE VIEW mysecview7
++       AS SELECT * FROM tbl1 WHERE a > 256;
++CREATE OR REPLACE VIEW mysecview8 WITH (security_invoker=true)
++       AS SELECT * FROM tbl1 WHERE a < 256;
++CREATE OR REPLACE VIEW mysecview9 WITH (security_invoker=false, security_barrier=true)
++       AS SELECT * FROM tbl1 WHERE a <> 256;
+ SELECT relname, relkind, reloptions FROM pg_class
+        WHERE oid in ('mysecview1'::regclass, 'mysecview2'::regclass,
+-                     'mysecview3'::regclass, 'mysecview4'::regclass)
++                     'mysecview3'::regclass, 'mysecview4'::regclass,
++                     'mysecview7'::regclass, 'mysecview8'::regclass,
++                     'mysecview9'::regclass)
+        ORDER BY relname;
+-  relname   | relkind |        reloptions        
+-------------+---------+--------------------------
++  relname   | relkind |                   reloptions                   
++------------+---------+------------------------------------------------
+  mysecview1 | v       | 
+  mysecview2 | v       | 
+  mysecview3 | v       | {security_barrier=true}
+  mysecview4 | v       | {security_barrier=false}
+-(4 rows)
++ mysecview7 | v       | 
++ mysecview8 | v       | {security_invoker=true}
++ mysecview9 | v       | {security_invoker=false,security_barrier=true}
++(7 rows)
+ 
+ -- Check that unknown literals are converted to "text" in CREATE VIEW,
+ -- so that we don't end up with unknown-type columns.
+@@ -2010,7 +2035,7 @@ drop cascades to view aliased_view_2
+ drop cascades to view aliased_view_3
+ drop cascades to view aliased_view_4
+ DROP SCHEMA testviewschm2 CASCADE;
+-NOTICE:  drop cascades to 74 other objects
++NOTICE:  drop cascades to 77 other objects
+ DETAIL:  drop cascades to table t1
+ drop cascades to view temporal1
+ drop cascades to view temporal2
+@@ -2031,6 +2056,9 @@ drop cascades to view mysecview1
+ drop cascades to view mysecview2
+ drop cascades to view mysecview3
+ drop cascades to view mysecview4
++drop cascades to view mysecview7
++drop cascades to view mysecview8
++drop cascades to view mysecview9
+ drop cascades to view unspecified_types
+ drop cascades to table tt1
+ drop cascades to table tx1
+diff --git a/src/test/regress/expected/lock.out b/src/test/regress/expected/lock.out
+index d43bee0c56..d4c7d42c63 100644
+--- a/src/test/regress/expected/lock.out
++++ b/src/test/regress/expected/lock.out
+@@ -152,9 +152,75 @@ BEGIN;
+ LOCK TABLE ONLY lock_tbl1;
+ ROLLBACK;
+ RESET ROLE;
++REVOKE UPDATE ON TABLE lock_tbl1 FROM regress_rol_lock1;
++-- Tables referred to by views are locked without explicit permission to do so
++-- as long as we have permission to lock the view itself.
++SET ROLE regress_rol_lock1;
++-- fail without permissions on the view
++BEGIN;
++LOCK TABLE lock_view1;
++ERROR:  permission denied for view lock_view1
++ROLLBACK;
++RESET ROLE;
++GRANT UPDATE ON TABLE lock_view1 TO regress_rol_lock1;
++SET ROLE regress_rol_lock1;
++BEGIN;
++LOCK TABLE lock_view1 IN ACCESS EXCLUSIVE MODE;
++-- lock_view1 and lock_tbl1 (plus children lock_tbl2 and lock_tbl3) are locked.
++select relname from pg_locks l, pg_class c
++ where l.relation = c.oid and relname like '%lock_%' and mode = 'AccessExclusiveLock'
++ order by relname;
++  relname   
++------------
++ lock_tbl1
++ lock_tbl2
++ lock_tbl3
++ lock_view1
++(4 rows)
++
++ROLLBACK;
++RESET ROLE;
++REVOKE UPDATE ON TABLE lock_view1 FROM regress_rol_lock1;
++-- Tables referred to by security invoker views require explicit permission to
++-- be locked.
++CREATE VIEW lock_view8 WITH (security_invoker) AS SELECT * FROM lock_tbl1;
++SET ROLE regress_rol_lock1;
++-- fail without permissions on the view
++BEGIN;
++LOCK TABLE lock_view8;
++ERROR:  permission denied for view lock_view8
++ROLLBACK;
++RESET ROLE;
++GRANT UPDATE ON TABLE lock_view8 TO regress_rol_lock1;
++SET ROLE regress_rol_lock1;
++-- fail without permissions on the table referenced by the view
++BEGIN;
++LOCK TABLE lock_view8;
++ERROR:  permission denied for table lock_tbl1
++ROLLBACK;
++RESET ROLE;
++GRANT UPDATE ON TABLE lock_tbl1 TO regress_rol_lock1;
++BEGIN;
++LOCK TABLE lock_view8 IN ACCESS EXCLUSIVE MODE;
++-- lock_view8 and lock_tbl1 (plus children lock_tbl2 and lock_tbl3) are locked.
++select relname from pg_locks l, pg_class c
++ where l.relation = c.oid and relname like '%lock_%' and mode = 'AccessExclusiveLock'
++ order by relname;
++  relname   
++------------
++ lock_tbl1
++ lock_tbl2
++ lock_tbl3
++ lock_view8
++(4 rows)
++
++ROLLBACK;
++RESET ROLE;
++REVOKE UPDATE ON TABLE lock_view8 FROM regress_rol_lock1;
+ --
+ -- Clean up
+ --
++DROP VIEW lock_view8;
+ DROP VIEW lock_view7;
+ DROP VIEW lock_view6;
+ DROP VIEW lock_view5;
+diff --git a/src/test/regress/expected/rowsecurity.out b/src/test/regress/expected/rowsecurity.out
+index 89397e41f0..d32a40ede3 100644
+--- a/src/test/regress/expected/rowsecurity.out
++++ b/src/test/regress/expected/rowsecurity.out
+@@ -2431,6 +2431,182 @@ ERROR:  permission denied for view rls_view
+ -- Query as role that is not the owner of the table or view with permissions.
+ SET SESSION AUTHORIZATION regress_rls_bob;
+ GRANT SELECT ON rls_view TO regress_rls_carol;
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view;
++NOTICE:  f_leak => bbb
++NOTICE:  f_leak => dad
++ a |  b  
++---+-----
++ 2 | bbb
++ 4 | dad
++(2 rows)
++
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 0) AND f_leak(b))
++(2 rows)
++
++-- Policy requiring access to another table.
++SET SESSION AUTHORIZATION regress_rls_alice;
++CREATE TABLE z1_blacklist (a int);
++INSERT INTO z1_blacklist VALUES (3), (4);
++CREATE POLICY p3 ON z1 AS RESTRICTIVE USING (a NOT IN (SELECT a FROM z1_blacklist));
++-- Query as role that is not owner of table but is owner of view without permissions.
++SET SESSION AUTHORIZATION regress_rls_bob;
++SELECT * FROM rls_view; --fail - permission denied.
++ERROR:  permission denied for table z1_blacklist
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view; --fail - permission denied.
++ERROR:  permission denied for table z1_blacklist
++-- Query as role that is not the owner of the table or view without permissions.
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view; --fail - permission denied.
++ERROR:  permission denied for table z1_blacklist
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view; --fail - permission denied.
++ERROR:  permission denied for table z1_blacklist
++-- Query as role that is not owner of table but is owner of view with permissions.
++SET SESSION AUTHORIZATION regress_rls_alice;
++GRANT SELECT ON z1_blacklist TO regress_rls_bob;
++SET SESSION AUTHORIZATION regress_rls_bob;
++SELECT * FROM rls_view;
++NOTICE:  f_leak => bbb
++ a |  b  
++---+-----
++ 2 | bbb
++(1 row)
++
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++                              QUERY PLAN                              
++----------------------------------------------------------------------
++ Seq Scan on z1
++   Filter: ((NOT (hashed SubPlan 1)) AND ((a % 2) = 0) AND f_leak(b))
++   SubPlan 1
++     ->  Seq Scan on z1_blacklist
++(4 rows)
++
++-- Query as role that is not the owner of the table or view with permissions.
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view;
++NOTICE:  f_leak => bbb
++ a |  b  
++---+-----
++ 2 | bbb
++(1 row)
++
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++                              QUERY PLAN                              
++----------------------------------------------------------------------
++ Seq Scan on z1
++   Filter: ((NOT (hashed SubPlan 1)) AND ((a % 2) = 0) AND f_leak(b))
++   SubPlan 1
++     ->  Seq Scan on z1_blacklist
++(4 rows)
++
++SET SESSION AUTHORIZATION regress_rls_alice;
++REVOKE SELECT ON z1_blacklist FROM regress_rls_bob;
++DROP POLICY p3 ON z1;
++SET SESSION AUTHORIZATION regress_rls_bob;
++DROP VIEW rls_view;
++--
++-- Security invoker views should follow policy for current user.
++--
++-- View and table owner are the same.
++SET SESSION AUTHORIZATION regress_rls_alice;
++CREATE VIEW rls_view WITH (security_invoker) AS
++    SELECT * FROM z1 WHERE f_leak(b);
++GRANT SELECT ON rls_view TO regress_rls_bob;
++GRANT SELECT ON rls_view TO regress_rls_carol;
++-- Query as table owner.  Should return all records.
++SELECT * FROM rls_view;
++NOTICE:  f_leak => aba
++NOTICE:  f_leak => bbb
++NOTICE:  f_leak => ccc
++NOTICE:  f_leak => dad
++ a |  b  
++---+-----
++ 1 | aba
++ 2 | bbb
++ 3 | ccc
++ 4 | dad
++(4 rows)
++
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++     QUERY PLAN      
++---------------------
++ Seq Scan on z1
++   Filter: f_leak(b)
++(2 rows)
++
++-- Queries as other users.
++-- Should return records based on current user's policies.
++SET SESSION AUTHORIZATION regress_rls_bob;
++SELECT * FROM rls_view;
++NOTICE:  f_leak => bbb
++NOTICE:  f_leak => dad
++ a |  b  
++---+-----
++ 2 | bbb
++ 4 | dad
++(2 rows)
++
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 0) AND f_leak(b))
++(2 rows)
++
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view;
++NOTICE:  f_leak => aba
++NOTICE:  f_leak => ccc
++ a |  b  
++---+-----
++ 1 | aba
++ 3 | ccc
++(2 rows)
++
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 1) AND f_leak(b))
++(2 rows)
++
++-- View and table owners are different.
++SET SESSION AUTHORIZATION regress_rls_alice;
++DROP VIEW rls_view;
++SET SESSION AUTHORIZATION regress_rls_bob;
++CREATE VIEW rls_view WITH (security_invoker) AS
++    SELECT * FROM z1 WHERE f_leak(b);
++GRANT SELECT ON rls_view TO regress_rls_alice;
++GRANT SELECT ON rls_view TO regress_rls_carol;
++-- Query as table owner.  Should return all records.
++SET SESSION AUTHORIZATION regress_rls_alice;
++SELECT * FROM rls_view;
++NOTICE:  f_leak => aba
++NOTICE:  f_leak => bbb
++NOTICE:  f_leak => ccc
++NOTICE:  f_leak => dad
++ a |  b  
++---+-----
++ 1 | aba
++ 2 | bbb
++ 3 | ccc
++ 4 | dad
++(4 rows)
++
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++     QUERY PLAN      
++---------------------
++ Seq Scan on z1
++   Filter: f_leak(b)
++(2 rows)
++
++-- Queries as other users.
++-- Should return records based on current user's policies.
++SET SESSION AUTHORIZATION regress_rls_bob;
+ SELECT * FROM rls_view;
+ NOTICE:  f_leak => bbb
+ NOTICE:  f_leak => dad
+@@ -2447,6 +2623,84 @@ EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
+    Filter: (((a % 2) = 0) AND f_leak(b))
+ (2 rows)
+ 
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view;
++NOTICE:  f_leak => aba
++NOTICE:  f_leak => ccc
++ a |  b  
++---+-----
++ 1 | aba
++ 3 | ccc
++(2 rows)
++
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 1) AND f_leak(b))
++(2 rows)
++
++-- Policy requiring access to another table.
++SET SESSION AUTHORIZATION regress_rls_alice;
++CREATE POLICY p3 ON z1 AS RESTRICTIVE USING (a NOT IN (SELECT a FROM z1_blacklist));
++-- Query as role that is not owner of table but is owner of view without permissions.
++SET SESSION AUTHORIZATION regress_rls_bob;
++SELECT * FROM rls_view; --fail - permission denied.
++ERROR:  permission denied for table z1_blacklist
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view; --fail - permission denied.
++ERROR:  permission denied for table z1_blacklist
++-- Query as role that is not the owner of the table or view without permissions.
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view; --fail - permission denied.
++ERROR:  permission denied for table z1_blacklist
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view; --fail - permission denied.
++ERROR:  permission denied for table z1_blacklist
++-- Query as role that is not owner of table but is owner of view with permissions.
++SET SESSION AUTHORIZATION regress_rls_alice;
++GRANT SELECT ON z1_blacklist TO regress_rls_bob;
++SET SESSION AUTHORIZATION regress_rls_bob;
++SELECT * FROM rls_view;
++NOTICE:  f_leak => bbb
++ a |  b  
++---+-----
++ 2 | bbb
++(1 row)
++
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++                              QUERY PLAN                              
++----------------------------------------------------------------------
++ Seq Scan on z1
++   Filter: ((NOT (hashed SubPlan 1)) AND ((a % 2) = 0) AND f_leak(b))
++   SubPlan 1
++     ->  Seq Scan on z1_blacklist
++(4 rows)
++
++-- Query as role that is not the owner of the table or view without permissions.
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view; --fail - permission denied.
++ERROR:  permission denied for table z1_blacklist
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view; --fail - permission denied.
++ERROR:  permission denied for table z1_blacklist
++-- Query as role that is not the owner of the table or view with permissions.
++SET SESSION AUTHORIZATION regress_rls_alice;
++GRANT SELECT ON z1_blacklist TO regress_rls_carol;
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view;
++NOTICE:  f_leak => aba
++ a |  b  
++---+-----
++ 1 | aba
++(1 row)
++
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++                              QUERY PLAN                              
++----------------------------------------------------------------------
++ Seq Scan on z1
++   Filter: ((NOT (hashed SubPlan 1)) AND ((a % 2) = 1) AND f_leak(b))
++   SubPlan 1
++     ->  Seq Scan on z1_blacklist
++(4 rows)
++
+ SET SESSION AUTHORIZATION regress_rls_bob;
+ DROP VIEW rls_view;
+ --
+@@ -3987,7 +4241,7 @@ RESET SESSION AUTHORIZATION;
+ --
+ RESET SESSION AUTHORIZATION;
+ DROP SCHEMA regress_rls_schema CASCADE;
+-NOTICE:  drop cascades to 29 other objects
++NOTICE:  drop cascades to 30 other objects
+ DETAIL:  drop cascades to function f_leak(text)
+ drop cascades to table uaccount
+ drop cascades to table category
+@@ -4005,6 +4259,7 @@ drop cascades to table b1
+ drop cascades to view bv1
+ drop cascades to table z1
+ drop cascades to table z2
++drop cascades to table z1_blacklist
+ drop cascades to table x1
+ drop cascades to table y1
+ drop cascades to table y2
+diff --git a/src/test/regress/expected/rules.out b/src/test/regress/expected/rules.out
+index 2fa00a3c29..be12666ecb 100644
+--- a/src/test/regress/expected/rules.out
++++ b/src/test/regress/expected/rules.out
+@@ -3699,3 +3699,33 @@ SELECT * FROM ruletest2;
+ 
+ DROP TABLE ruletest1;
+ DROP TABLE ruletest2;
++--
++-- Test non-SELECT rule on security invoker view.
++-- Should use view owner's permissions.
++-- 
++CREATE USER regress_rule_user1;
++CREATE TABLE ruletest_t1 (x int);
++CREATE TABLE ruletest_t2 (x int);
++CREATE VIEW ruletest_v1 WITH (security_invoker=true) AS
++    SELECT * FROM ruletest_t1;
++GRANT INSERT ON ruletest_v1 TO regress_rule_user1;
++CREATE RULE rule1 AS ON INSERT TO ruletest_v1
++    DO INSTEAD INSERT INTO ruletest_t2 VALUES (NEW.*);
++SET SESSION AUTHORIZATION regress_rule_user1;
++INSERT INTO ruletest_v1 VALUES (1);
++RESET SESSION AUTHORIZATION;
++SELECT * FROM ruletest_t1;
++ x 
++---
++(0 rows)
++
++SELECT * FROM ruletest_t2;
++ x 
++---
++ 1
++(1 row)
++
++DROP VIEW ruletest_v1;
++DROP TABLE ruletest_t2;
++DROP TABLE ruletest_t1;
++DROP USER regress_rule_user1;
+diff --git a/src/test/regress/expected/updatable_views.out b/src/test/regress/expected/updatable_views.out
+index cdff914b93..d57eeb761c 100644
+--- a/src/test/regress/expected/updatable_views.out
++++ b/src/test/regress/expected/updatable_views.out
+@@ -979,6 +979,7 @@ drop cascades to function rw_view1_aa(rw_view1)
+ -- permissions checks
+ CREATE USER regress_view_user1;
+ CREATE USER regress_view_user2;
++CREATE USER regress_view_user3;
+ SET SESSION AUTHORIZATION regress_view_user1;
+ CREATE TABLE base_tbl(a int, b text, c float);
+ INSERT INTO base_tbl VALUES (1, 'Row 1', 1.0);
+@@ -1205,8 +1206,244 @@ DROP TABLE base_tbl CASCADE;
+ NOTICE:  drop cascades to 2 other objects
+ DETAIL:  drop cascades to view rw_view1
+ drop cascades to view rw_view2
++-- security invoker view permissions
++SET SESSION AUTHORIZATION regress_view_user1;
++CREATE TABLE base_tbl(a int, b text, c float);
++INSERT INTO base_tbl VALUES (1, 'Row 1', 1.0);
++CREATE VIEW rw_view1 AS SELECT b AS bb, c AS cc, a AS aa FROM base_tbl;
++ALTER VIEW rw_view1 SET (security_invoker = true);
++INSERT INTO rw_view1 VALUES ('Row 2', 2.0, 2);
++GRANT SELECT ON rw_view1 TO regress_view_user2;
++GRANT UPDATE (bb,cc) ON rw_view1 TO regress_view_user2;
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM base_tbl; -- not allowed
++ERROR:  permission denied for table base_tbl
++SELECT * FROM rw_view1; -- not allowed
++ERROR:  permission denied for table base_tbl
++INSERT INTO base_tbl VALUES (3, 'Row 3', 3.0); -- not allowed
++ERROR:  permission denied for table base_tbl
++INSERT INTO rw_view1 VALUES ('Row 3', 3.0, 3); -- not allowed
++ERROR:  permission denied for view rw_view1
++UPDATE base_tbl SET a=a; -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view1 SET bb=bb, cc=cc; -- not allowed
++ERROR:  permission denied for table base_tbl
++DELETE FROM base_tbl; -- not allowed
++ERROR:  permission denied for table base_tbl
++DELETE FROM rw_view1; -- not allowed
++ERROR:  permission denied for view rw_view1
++SET SESSION AUTHORIZATION regress_view_user1;
++GRANT SELECT ON base_tbl TO regress_view_user2;
++GRANT UPDATE (a,c) ON base_tbl TO regress_view_user2;
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM base_tbl; -- ok
++ a |   b   | c 
++---+-------+---
++ 1 | Row 1 | 1
++ 2 | Row 2 | 2
++(2 rows)
++
++SELECT * FROM rw_view1; -- ok
++  bb   | cc | aa 
++-------+----+----
++ Row 1 |  1 |  1
++ Row 2 |  2 |  2
++(2 rows)
++
++UPDATE base_tbl SET a=a, c=c; -- ok
++UPDATE base_tbl SET b=b; -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view1 SET cc=cc; -- ok
++UPDATE rw_view1 SET aa=aa; -- not allowed
++ERROR:  permission denied for view rw_view1
++UPDATE rw_view1 SET bb=bb; -- not allowed
++ERROR:  permission denied for table base_tbl
++SET SESSION AUTHORIZATION regress_view_user1;
++GRANT INSERT, DELETE ON base_tbl TO regress_view_user2;
++SET SESSION AUTHORIZATION regress_view_user2;
++INSERT INTO base_tbl VALUES (3, 'Row 3', 3.0); -- ok
++INSERT INTO rw_view1 VALUES ('Row 4', 4.0, 4); -- not allowed
++ERROR:  permission denied for view rw_view1
++DELETE FROM base_tbl WHERE a=1; -- ok
++DELETE FROM rw_view1 WHERE aa=2; -- not allowed
++ERROR:  permission denied for view rw_view1
++SET SESSION AUTHORIZATION regress_view_user1;
++REVOKE INSERT, DELETE ON base_tbl FROM regress_view_user2;
++GRANT INSERT, DELETE ON rw_view1 TO regress_view_user2;
++SET SESSION AUTHORIZATION regress_view_user2;
++INSERT INTO rw_view1 VALUES ('Row 4', 4.0, 4); -- not allowed
++ERROR:  permission denied for table base_tbl
++DELETE FROM rw_view1 WHERE aa=2; -- not allowed
++ERROR:  permission denied for table base_tbl
++SET SESSION AUTHORIZATION regress_view_user1;
++GRANT INSERT, DELETE ON base_tbl TO regress_view_user2;
++SET SESSION AUTHORIZATION regress_view_user2;
++INSERT INTO rw_view1 VALUES ('Row 4', 4.0, 4); -- ok
++DELETE FROM rw_view1 WHERE aa=2; -- ok
++SELECT * FROM base_tbl; -- ok
++ a |   b   | c 
++---+-------+---
++ 3 | Row 3 | 3
++ 4 | Row 4 | 4
++(2 rows)
++
++RESET SESSION AUTHORIZATION;
++DROP TABLE base_tbl CASCADE;
++NOTICE:  drop cascades to view rw_view1
++-- ordinary view on top of security invoker view permissions
++CREATE TABLE base_tbl(a int, b text, c float);
++INSERT INTO base_tbl VALUES (1, 'Row 1', 1.0);
++SET SESSION AUTHORIZATION regress_view_user1;
++CREATE VIEW rw_view1 AS SELECT b AS bb, c AS cc, a AS aa FROM base_tbl;
++ALTER VIEW rw_view1 SET (security_invoker = true);
++SELECT * FROM rw_view1;  -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view1 SET aa=aa;  -- not allowed
++ERROR:  permission denied for table base_tbl
++SET SESSION AUTHORIZATION regress_view_user2;
++CREATE VIEW rw_view2 AS SELECT cc AS ccc, aa AS aaa, bb AS bbb FROM rw_view1;
++GRANT SELECT, UPDATE ON rw_view2 TO regress_view_user3;
++SELECT * FROM rw_view2;  -- not allowed
++ERROR:  permission denied for view rw_view1
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++ERROR:  permission denied for view rw_view1
++RESET SESSION AUTHORIZATION;
++GRANT SELECT ON base_tbl TO regress_view_user1;
++GRANT UPDATE (a, b) ON base_tbl TO regress_view_user1;
++SET SESSION AUTHORIZATION regress_view_user1;
++SELECT * FROM rw_view1; -- ok
++  bb   | cc | aa 
++-------+----+----
++ Row 1 |  1 |  1
++(1 row)
++
++UPDATE rw_view1 SET aa=aa, bb=bb;  -- ok
++UPDATE rw_view1 SET cc=cc;  -- not allowed
++ERROR:  permission denied for table base_tbl
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM rw_view2;  -- not allowed
++ERROR:  permission denied for view rw_view1
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++ERROR:  permission denied for view rw_view1
++SET SESSION AUTHORIZATION regress_view_user3;
++SELECT * FROM rw_view2;  -- not allowed
++ERROR:  permission denied for view rw_view1
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++ERROR:  permission denied for view rw_view1
++SET SESSION AUTHORIZATION regress_view_user1;
++GRANT SELECT ON rw_view1 TO regress_view_user2;
++GRANT UPDATE (bb, cc) ON rw_view1 TO regress_view_user2;
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM rw_view2;  -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++ERROR:  permission denied for table base_tbl
++SET SESSION AUTHORIZATION regress_view_user3;
++SELECT * FROM rw_view2;  -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++ERROR:  permission denied for table base_tbl
++RESET SESSION AUTHORIZATION;
++GRANT SELECT ON base_tbl TO regress_view_user2;
++GRANT UPDATE (a, c) ON base_tbl TO regress_view_user2;
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM rw_view2;  -- ok
++ ccc | aaa |  bbb  
++-----+-----+-------
++   1 |   1 | Row 1
++(1 row)
++
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++ERROR:  permission denied for view rw_view1
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view2 SET ccc=ccc;  -- ok
++SET SESSION AUTHORIZATION regress_view_user3;
++SELECT * FROM rw_view2;  -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++ERROR:  permission denied for view rw_view1
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view2 SET ccc=ccc;  -- not allowed
++ERROR:  permission denied for table base_tbl
++RESET SESSION AUTHORIZATION;
++GRANT SELECT ON base_tbl TO regress_view_user3;
++GRANT UPDATE (a, c) ON base_tbl TO regress_view_user3;
++SET SESSION AUTHORIZATION regress_view_user3;
++SELECT * FROM rw_view2;  -- ok
++ ccc | aaa |  bbb  
++-----+-----+-------
++   1 |   1 | Row 1
++(1 row)
++
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++ERROR:  permission denied for view rw_view1
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view2 SET ccc=ccc;  -- ok
++RESET SESSION AUTHORIZATION;
++REVOKE SELECT, UPDATE ON base_tbl FROM regress_view_user1;
++SET SESSION AUTHORIZATION regress_view_user1;
++SELECT * FROM rw_view1;  -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view1 SET aa=aa;  -- not allowed
++ERROR:  permission denied for table base_tbl
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM rw_view2;  -- ok
++ ccc | aaa |  bbb  
++-----+-----+-------
++   1 |   1 | Row 1
++(1 row)
++
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++ERROR:  permission denied for view rw_view1
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view2 SET ccc=ccc;  -- ok
++SET SESSION AUTHORIZATION regress_view_user3;
++SELECT * FROM rw_view2;  -- ok
++ ccc | aaa |  bbb  
++-----+-----+-------
++   1 |   1 | Row 1
++(1 row)
++
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++ERROR:  permission denied for view rw_view1
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view2 SET ccc=ccc;  -- ok
++RESET SESSION AUTHORIZATION;
++REVOKE SELECT, UPDATE ON base_tbl FROM regress_view_user2;
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM rw_view2;  -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++ERROR:  permission denied for view rw_view1
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view2 SET ccc=ccc;  -- not allowed
++ERROR:  permission denied for table base_tbl
++SET SESSION AUTHORIZATION regress_view_user3;
++SELECT * FROM rw_view2;  -- ok
++ ccc | aaa |  bbb  
++-----+-----+-------
++   1 |   1 | Row 1
++(1 row)
++
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++ERROR:  permission denied for view rw_view1
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++ERROR:  permission denied for table base_tbl
++UPDATE rw_view2 SET ccc=ccc;  -- ok
++RESET SESSION AUTHORIZATION;
++DROP TABLE base_tbl CASCADE;
++NOTICE:  drop cascades to 2 other objects
++DETAIL:  drop cascades to view rw_view1
++drop cascades to view rw_view2
+ DROP USER regress_view_user1;
+ DROP USER regress_view_user2;
++DROP USER regress_view_user3;
+ -- column defaults
+ CREATE TABLE base_tbl (a int PRIMARY KEY, b text DEFAULT 'Unspecified', c serial);
+ INSERT INTO base_tbl VALUES (1, 'Row 1');
+diff --git a/src/test/regress/sql/create_view.sql b/src/test/regress/sql/create_view.sql
+index 82df4b7cac..5b2fcf1cb5 100644
+--- a/src/test/regress/sql/create_view.sql
++++ b/src/test/regress/sql/create_view.sql
+@@ -218,9 +218,19 @@ CREATE VIEW mysecview5 WITH (security_barrier=100)	-- Error
+        AS SELECT * FROM tbl1 WHERE a > 100;
+ CREATE VIEW mysecview6 WITH (invalid_option)		-- Error
+        AS SELECT * FROM tbl1 WHERE a < 100;
++CREATE VIEW mysecview7 WITH (security_invoker=true)
++       AS SELECT * FROM tbl1 WHERE a = 100;
++CREATE VIEW mysecview8 WITH (security_invoker=false, security_barrier=true)
++       AS SELECT * FROM tbl1 WHERE a > 100;
++CREATE VIEW mysecview9 WITH (security_invoker)
++       AS SELECT * FROM tbl1 WHERE a < 100;
++CREATE VIEW mysecview10 WITH (security_invoker=100)	-- Error
++       AS SELECT * FROM tbl1 WHERE a <> 100;
+ SELECT relname, relkind, reloptions FROM pg_class
+        WHERE oid in ('mysecview1'::regclass, 'mysecview2'::regclass,
+-                     'mysecview3'::regclass, 'mysecview4'::regclass)
++                     'mysecview3'::regclass, 'mysecview4'::regclass,
++                     'mysecview7'::regclass, 'mysecview8'::regclass,
++                     'mysecview9'::regclass)
+        ORDER BY relname;
+ 
+ CREATE OR REPLACE VIEW mysecview1
+@@ -231,9 +241,17 @@ CREATE OR REPLACE VIEW mysecview3 WITH (security_barrier=true)
+        AS SELECT * FROM tbl1 WHERE a < 256;
+ CREATE OR REPLACE VIEW mysecview4 WITH (security_barrier=false)
+        AS SELECT * FROM tbl1 WHERE a <> 256;
++CREATE OR REPLACE VIEW mysecview7
++       AS SELECT * FROM tbl1 WHERE a > 256;
++CREATE OR REPLACE VIEW mysecview8 WITH (security_invoker=true)
++       AS SELECT * FROM tbl1 WHERE a < 256;
++CREATE OR REPLACE VIEW mysecview9 WITH (security_invoker=false, security_barrier=true)
++       AS SELECT * FROM tbl1 WHERE a <> 256;
+ SELECT relname, relkind, reloptions FROM pg_class
+        WHERE oid in ('mysecview1'::regclass, 'mysecview2'::regclass,
+-                     'mysecview3'::regclass, 'mysecview4'::regclass)
++                     'mysecview3'::regclass, 'mysecview4'::regclass,
++                     'mysecview7'::regclass, 'mysecview8'::regclass,
++                     'mysecview9'::regclass)
+        ORDER BY relname;
+ 
+ -- Check that unknown literals are converted to "text" in CREATE VIEW,
+diff --git a/src/test/regress/sql/lock.sql b/src/test/regress/sql/lock.sql
+index 05bdb8ad4c..11d7bbc2df 100644
+--- a/src/test/regress/sql/lock.sql
++++ b/src/test/regress/sql/lock.sql
+@@ -116,10 +116,59 @@ BEGIN;
+ LOCK TABLE ONLY lock_tbl1;
+ ROLLBACK;
+ RESET ROLE;
++REVOKE UPDATE ON TABLE lock_tbl1 FROM regress_rol_lock1;
++
++-- Tables referred to by views are locked without explicit permission to do so
++-- as long as we have permission to lock the view itself.
++SET ROLE regress_rol_lock1;
++-- fail without permissions on the view
++BEGIN;
++LOCK TABLE lock_view1;
++ROLLBACK;
++RESET ROLE;
++GRANT UPDATE ON TABLE lock_view1 TO regress_rol_lock1;
++SET ROLE regress_rol_lock1;
++BEGIN;
++LOCK TABLE lock_view1 IN ACCESS EXCLUSIVE MODE;
++-- lock_view1 and lock_tbl1 (plus children lock_tbl2 and lock_tbl3) are locked.
++select relname from pg_locks l, pg_class c
++ where l.relation = c.oid and relname like '%lock_%' and mode = 'AccessExclusiveLock'
++ order by relname;
++ROLLBACK;
++RESET ROLE;
++REVOKE UPDATE ON TABLE lock_view1 FROM regress_rol_lock1;
++
++-- Tables referred to by security invoker views require explicit permission to
++-- be locked.
++CREATE VIEW lock_view8 WITH (security_invoker) AS SELECT * FROM lock_tbl1;
++SET ROLE regress_rol_lock1;
++-- fail without permissions on the view
++BEGIN;
++LOCK TABLE lock_view8;
++ROLLBACK;
++RESET ROLE;
++GRANT UPDATE ON TABLE lock_view8 TO regress_rol_lock1;
++SET ROLE regress_rol_lock1;
++-- fail without permissions on the table referenced by the view
++BEGIN;
++LOCK TABLE lock_view8;
++ROLLBACK;
++RESET ROLE;
++GRANT UPDATE ON TABLE lock_tbl1 TO regress_rol_lock1;
++BEGIN;
++LOCK TABLE lock_view8 IN ACCESS EXCLUSIVE MODE;
++-- lock_view8 and lock_tbl1 (plus children lock_tbl2 and lock_tbl3) are locked.
++select relname from pg_locks l, pg_class c
++ where l.relation = c.oid and relname like '%lock_%' and mode = 'AccessExclusiveLock'
++ order by relname;
++ROLLBACK;
++RESET ROLE;
++REVOKE UPDATE ON TABLE lock_view8 FROM regress_rol_lock1;
+ 
+ --
+ -- Clean up
+ --
++DROP VIEW lock_view8;
+ DROP VIEW lock_view7;
+ DROP VIEW lock_view6;
+ DROP VIEW lock_view5;
+diff --git a/src/test/regress/sql/rowsecurity.sql b/src/test/regress/sql/rowsecurity.sql
+index 44deb42bad..b310acdd27 100644
+--- a/src/test/regress/sql/rowsecurity.sql
++++ b/src/test/regress/sql/rowsecurity.sql
+@@ -912,6 +912,128 @@ EXPLAIN (COSTS OFF) SELECT * FROM rls_view; --fail - permission denied.
+ -- Query as role that is not the owner of the table or view with permissions.
+ SET SESSION AUTHORIZATION regress_rls_bob;
+ GRANT SELECT ON rls_view TO regress_rls_carol;
++
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view;
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++
++-- Policy requiring access to another table.
++SET SESSION AUTHORIZATION regress_rls_alice;
++CREATE TABLE z1_blacklist (a int);
++INSERT INTO z1_blacklist VALUES (3), (4);
++CREATE POLICY p3 ON z1 AS RESTRICTIVE USING (a NOT IN (SELECT a FROM z1_blacklist));
++
++-- Query as role that is not owner of table but is owner of view without permissions.
++SET SESSION AUTHORIZATION regress_rls_bob;
++SELECT * FROM rls_view; --fail - permission denied.
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view; --fail - permission denied.
++
++-- Query as role that is not the owner of the table or view without permissions.
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view; --fail - permission denied.
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view; --fail - permission denied.
++
++-- Query as role that is not owner of table but is owner of view with permissions.
++SET SESSION AUTHORIZATION regress_rls_alice;
++GRANT SELECT ON z1_blacklist TO regress_rls_bob;
++
++SET SESSION AUTHORIZATION regress_rls_bob;
++SELECT * FROM rls_view;
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++
++-- Query as role that is not the owner of the table or view with permissions.
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view;
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++
++SET SESSION AUTHORIZATION regress_rls_alice;
++REVOKE SELECT ON z1_blacklist FROM regress_rls_bob;
++DROP POLICY p3 ON z1;
++
++SET SESSION AUTHORIZATION regress_rls_bob;
++DROP VIEW rls_view;
++
++--
++-- Security invoker views should follow policy for current user.
++--
++-- View and table owner are the same.
++SET SESSION AUTHORIZATION regress_rls_alice;
++CREATE VIEW rls_view WITH (security_invoker) AS
++    SELECT * FROM z1 WHERE f_leak(b);
++GRANT SELECT ON rls_view TO regress_rls_bob;
++GRANT SELECT ON rls_view TO regress_rls_carol;
++
++-- Query as table owner.  Should return all records.
++SELECT * FROM rls_view;
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++
++-- Queries as other users.
++-- Should return records based on current user's policies.
++SET SESSION AUTHORIZATION regress_rls_bob;
++SELECT * FROM rls_view;
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view;
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++
++-- View and table owners are different.
++SET SESSION AUTHORIZATION regress_rls_alice;
++DROP VIEW rls_view;
++
++SET SESSION AUTHORIZATION regress_rls_bob;
++CREATE VIEW rls_view WITH (security_invoker) AS
++    SELECT * FROM z1 WHERE f_leak(b);
++GRANT SELECT ON rls_view TO regress_rls_alice;
++GRANT SELECT ON rls_view TO regress_rls_carol;
++
++-- Query as table owner.  Should return all records.
++SET SESSION AUTHORIZATION regress_rls_alice;
++SELECT * FROM rls_view;
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++
++-- Queries as other users.
++-- Should return records based on current user's policies.
++SET SESSION AUTHORIZATION regress_rls_bob;
++SELECT * FROM rls_view;
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view;
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++
++-- Policy requiring access to another table.
++SET SESSION AUTHORIZATION regress_rls_alice;
++CREATE POLICY p3 ON z1 AS RESTRICTIVE USING (a NOT IN (SELECT a FROM z1_blacklist));
++
++-- Query as role that is not owner of table but is owner of view without permissions.
++SET SESSION AUTHORIZATION regress_rls_bob;
++SELECT * FROM rls_view; --fail - permission denied.
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view; --fail - permission denied.
++
++-- Query as role that is not the owner of the table or view without permissions.
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view; --fail - permission denied.
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view; --fail - permission denied.
++
++-- Query as role that is not owner of table but is owner of view with permissions.
++SET SESSION AUTHORIZATION regress_rls_alice;
++GRANT SELECT ON z1_blacklist TO regress_rls_bob;
++
++SET SESSION AUTHORIZATION regress_rls_bob;
++SELECT * FROM rls_view;
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
++
++-- Query as role that is not the owner of the table or view without permissions.
++SET SESSION AUTHORIZATION regress_rls_carol;
++SELECT * FROM rls_view; --fail - permission denied.
++EXPLAIN (COSTS OFF) SELECT * FROM rls_view; --fail - permission denied.
++
++-- Query as role that is not the owner of the table or view with permissions.
++SET SESSION AUTHORIZATION regress_rls_alice;
++GRANT SELECT ON z1_blacklist TO regress_rls_carol;
++
++SET SESSION AUTHORIZATION regress_rls_carol;
+ SELECT * FROM rls_view;
+ EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
+ 
+diff --git a/src/test/regress/sql/rules.sql b/src/test/regress/sql/rules.sql
+index b732833e63..b5e8ab113c 100644
+--- a/src/test/regress/sql/rules.sql
++++ b/src/test/regress/sql/rules.sql
+@@ -1257,3 +1257,31 @@ SELECT * FROM ruletest2;
+ 
+ DROP TABLE ruletest1;
+ DROP TABLE ruletest2;
++
++--
++-- Test non-SELECT rule on security invoker view.
++-- Should use view owner's permissions.
++-- 
++CREATE USER regress_rule_user1;
++
++CREATE TABLE ruletest_t1 (x int);
++CREATE TABLE ruletest_t2 (x int);
++CREATE VIEW ruletest_v1 WITH (security_invoker=true) AS
++    SELECT * FROM ruletest_t1;
++GRANT INSERT ON ruletest_v1 TO regress_rule_user1;
++
++CREATE RULE rule1 AS ON INSERT TO ruletest_v1
++    DO INSTEAD INSERT INTO ruletest_t2 VALUES (NEW.*);
++
++SET SESSION AUTHORIZATION regress_rule_user1;
++INSERT INTO ruletest_v1 VALUES (1);
++
++RESET SESSION AUTHORIZATION;
++SELECT * FROM ruletest_t1;
++SELECT * FROM ruletest_t2;
++
++DROP VIEW ruletest_v1;
++DROP TABLE ruletest_t2;
++DROP TABLE ruletest_t1;
++
++DROP USER regress_rule_user1;
+diff --git a/src/test/regress/sql/updatable_views.sql b/src/test/regress/sql/updatable_views.sql
+index 09328e582b..fa206a8fe7 100644
+--- a/src/test/regress/sql/updatable_views.sql
++++ b/src/test/regress/sql/updatable_views.sql
+@@ -410,6 +410,7 @@ DROP TABLE base_tbl CASCADE;
+ 
+ CREATE USER regress_view_user1;
+ CREATE USER regress_view_user2;
++CREATE USER regress_view_user3;
+ 
+ SET SESSION AUTHORIZATION regress_view_user1;
+ CREATE TABLE base_tbl(a int, b text, c float);
+@@ -552,8 +553,187 @@ RESET SESSION AUTHORIZATION;
+ 
+ DROP TABLE base_tbl CASCADE;
+ 
++-- security invoker view permissions
++
++SET SESSION AUTHORIZATION regress_view_user1;
++CREATE TABLE base_tbl(a int, b text, c float);
++INSERT INTO base_tbl VALUES (1, 'Row 1', 1.0);
++CREATE VIEW rw_view1 AS SELECT b AS bb, c AS cc, a AS aa FROM base_tbl;
++ALTER VIEW rw_view1 SET (security_invoker = true);
++INSERT INTO rw_view1 VALUES ('Row 2', 2.0, 2);
++GRANT SELECT ON rw_view1 TO regress_view_user2;
++GRANT UPDATE (bb,cc) ON rw_view1 TO regress_view_user2;
++
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM base_tbl; -- not allowed
++SELECT * FROM rw_view1; -- not allowed
++INSERT INTO base_tbl VALUES (3, 'Row 3', 3.0); -- not allowed
++INSERT INTO rw_view1 VALUES ('Row 3', 3.0, 3); -- not allowed
++UPDATE base_tbl SET a=a; -- not allowed
++UPDATE rw_view1 SET bb=bb, cc=cc; -- not allowed
++DELETE FROM base_tbl; -- not allowed
++DELETE FROM rw_view1; -- not allowed
++
++SET SESSION AUTHORIZATION regress_view_user1;
++GRANT SELECT ON base_tbl TO regress_view_user2;
++GRANT UPDATE (a,c) ON base_tbl TO regress_view_user2;
++
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM base_tbl; -- ok
++SELECT * FROM rw_view1; -- ok
++UPDATE base_tbl SET a=a, c=c; -- ok
++UPDATE base_tbl SET b=b; -- not allowed
++UPDATE rw_view1 SET cc=cc; -- ok
++UPDATE rw_view1 SET aa=aa; -- not allowed
++UPDATE rw_view1 SET bb=bb; -- not allowed
++
++SET SESSION AUTHORIZATION regress_view_user1;
++GRANT INSERT, DELETE ON base_tbl TO regress_view_user2;
++
++SET SESSION AUTHORIZATION regress_view_user2;
++INSERT INTO base_tbl VALUES (3, 'Row 3', 3.0); -- ok
++INSERT INTO rw_view1 VALUES ('Row 4', 4.0, 4); -- not allowed
++DELETE FROM base_tbl WHERE a=1; -- ok
++DELETE FROM rw_view1 WHERE aa=2; -- not allowed
++
++SET SESSION AUTHORIZATION regress_view_user1;
++REVOKE INSERT, DELETE ON base_tbl FROM regress_view_user2;
++GRANT INSERT, DELETE ON rw_view1 TO regress_view_user2;
++
++SET SESSION AUTHORIZATION regress_view_user2;
++INSERT INTO rw_view1 VALUES ('Row 4', 4.0, 4); -- not allowed
++DELETE FROM rw_view1 WHERE aa=2; -- not allowed
++
++SET SESSION AUTHORIZATION regress_view_user1;
++GRANT INSERT, DELETE ON base_tbl TO regress_view_user2;
++
++SET SESSION AUTHORIZATION regress_view_user2;
++INSERT INTO rw_view1 VALUES ('Row 4', 4.0, 4); -- ok
++DELETE FROM rw_view1 WHERE aa=2; -- ok
++SELECT * FROM base_tbl; -- ok
++
++RESET SESSION AUTHORIZATION;
++
++DROP TABLE base_tbl CASCADE;
++
++-- ordinary view on top of security invoker view permissions
++
++CREATE TABLE base_tbl(a int, b text, c float);
++INSERT INTO base_tbl VALUES (1, 'Row 1', 1.0);
++
++SET SESSION AUTHORIZATION regress_view_user1;
++CREATE VIEW rw_view1 AS SELECT b AS bb, c AS cc, a AS aa FROM base_tbl;
++ALTER VIEW rw_view1 SET (security_invoker = true);
++SELECT * FROM rw_view1;  -- not allowed
++UPDATE rw_view1 SET aa=aa;  -- not allowed
++
++SET SESSION AUTHORIZATION regress_view_user2;
++CREATE VIEW rw_view2 AS SELECT cc AS ccc, aa AS aaa, bb AS bbb FROM rw_view1;
++GRANT SELECT, UPDATE ON rw_view2 TO regress_view_user3;
++SELECT * FROM rw_view2;  -- not allowed
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++
++RESET SESSION AUTHORIZATION;
++
++GRANT SELECT ON base_tbl TO regress_view_user1;
++GRANT UPDATE (a, b) ON base_tbl TO regress_view_user1;
++
++SET SESSION AUTHORIZATION regress_view_user1;
++SELECT * FROM rw_view1; -- ok
++UPDATE rw_view1 SET aa=aa, bb=bb;  -- ok
++UPDATE rw_view1 SET cc=cc;  -- not allowed
++
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM rw_view2;  -- not allowed
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++
++SET SESSION AUTHORIZATION regress_view_user3;
++SELECT * FROM rw_view2;  -- not allowed
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++
++SET SESSION AUTHORIZATION regress_view_user1;
++GRANT SELECT ON rw_view1 TO regress_view_user2;
++GRANT UPDATE (bb, cc) ON rw_view1 TO regress_view_user2;
++
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM rw_view2;  -- not allowed
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++
++SET SESSION AUTHORIZATION regress_view_user3;
++SELECT * FROM rw_view2;  -- not allowed
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++
++RESET SESSION AUTHORIZATION;
++
++GRANT SELECT ON base_tbl TO regress_view_user2;
++GRANT UPDATE (a, c) ON base_tbl TO regress_view_user2;
++
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM rw_view2;  -- ok
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++UPDATE rw_view2 SET ccc=ccc;  -- ok
++
++SET SESSION AUTHORIZATION regress_view_user3;
++SELECT * FROM rw_view2;  -- not allowed
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++UPDATE rw_view2 SET ccc=ccc;  -- not allowed
++
++RESET SESSION AUTHORIZATION;
++
++GRANT SELECT ON base_tbl TO regress_view_user3;
++GRANT UPDATE (a, c) ON base_tbl TO regress_view_user3;
++
++SET SESSION AUTHORIZATION regress_view_user3;
++SELECT * FROM rw_view2;  -- ok
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++UPDATE rw_view2 SET ccc=ccc;  -- ok
++
++RESET SESSION AUTHORIZATION;
++
++REVOKE SELECT, UPDATE ON base_tbl FROM regress_view_user1;
++
++SET SESSION AUTHORIZATION regress_view_user1;
++SELECT * FROM rw_view1;  -- not allowed
++UPDATE rw_view1 SET aa=aa;  -- not allowed
++
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM rw_view2;  -- ok
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++UPDATE rw_view2 SET ccc=ccc;  -- ok
++
++SET SESSION AUTHORIZATION regress_view_user3;
++SELECT * FROM rw_view2;  -- ok
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++UPDATE rw_view2 SET ccc=ccc;  -- ok
++
++RESET SESSION AUTHORIZATION;
++
++REVOKE SELECT, UPDATE ON base_tbl FROM regress_view_user2;
++
++SET SESSION AUTHORIZATION regress_view_user2;
++SELECT * FROM rw_view2;  -- not allowed
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++UPDATE rw_view2 SET ccc=ccc;  -- not allowed
++
++SET SESSION AUTHORIZATION regress_view_user3;
++SELECT * FROM rw_view2;  -- ok
++UPDATE rw_view2 SET aaa=aaa;  -- not allowed
++UPDATE rw_view2 SET bbb=bbb;  -- not allowed
++UPDATE rw_view2 SET ccc=ccc;  -- ok
++
++RESET SESSION AUTHORIZATION;
++
++DROP TABLE base_tbl CASCADE;
++
+ DROP USER regress_view_user1;
+ DROP USER regress_view_user2;
++DROP USER regress_view_user3;
+ 
+ -- column defaults
+ 
+-- 
+2.35.1
+
