@@ -1,7 +1,12 @@
 {
   "extends": [
     "config:base",
-    "regexManagers:dockerfileVersions",
-    "schedule:earlyMondays"
+    "regexManagers:dockerfileVersions"
+  ],
+  "packageRules": [
+    {
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "automerge": true
+    }
   ]
 }
