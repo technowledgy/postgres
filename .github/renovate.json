@@ -3,6 +3,9 @@
     "config:base",
     "regexManagers:dockerfileVersions"
   ],
+  "git-submodules": {
+    "enabled": true
+  },
   "packageRules": [
     {
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
