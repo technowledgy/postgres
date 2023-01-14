@@ -20,6 +20,6 @@ jobs:
       - name: Patch Dockerfile
         run: ./build.sh
       - name: Build
-        uses: docker/build-push-action@v3.2.0
+        uses: docker/build-push-action@v3.3.0
         with:
           context: .
