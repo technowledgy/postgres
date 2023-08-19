@@ -58,7 +58,7 @@ index b5602f5323..1186e4ab7d 100644
  	{
  		{
  			"vacuum_truncate",
-@@ -1996,6 +2005,8 @@ view_reloptions(Datum reloptions, bool validate)
+@@ -1997,6 +2006,8 @@ view_reloptions(Datum reloptions, bool validate)
  	static const relopt_parse_elt tab[] = {
  		{"security_barrier", RELOPT_TYPE_BOOL,
  		offsetof(ViewOptions, security_barrier)},
@@ -117,7 +117,7 @@ diff --git a/src/backend/rewrite/rewriteHandler.c b/src/backend/rewrite/rewriteH
 index 9521e81100..be5c41b20c 100644
 --- a/src/backend/rewrite/rewriteHandler.c
 +++ b/src/backend/rewrite/rewriteHandler.c
-@@ -3242,18 +3242,24 @@ rewriteTargetView(Query *parsetree, Relation view)
+@@ -3274,18 +3274,24 @@ rewriteTargetView(Query *parsetree, Relation view)
  				   0);
  
  	/*
@@ -271,7 +271,7 @@ diff --git a/src/include/utils/rel.h b/src/include/utils/rel.h
 index 77d176a934..ccd6fefc54 100644
 --- a/src/include/utils/rel.h
 +++ b/src/include/utils/rel.h
-@@ -397,6 +397,7 @@ typedef struct ViewOptions
+@@ -396,6 +396,7 @@ typedef struct ViewOptions
  {
  	int32		vl_len_;		/* varlena header (do not touch directly!) */
  	bool		security_barrier;
@@ -279,7 +279,7 @@ index 77d176a934..ccd6fefc54 100644
  	ViewOptCheckOption check_option;
  } ViewOptions;
  
-@@ -410,6 +411,16 @@ typedef struct ViewOptions
+@@ -409,6 +410,16 @@ typedef struct ViewOptions
  	 (relation)->rd_options ?												\
  	  ((ViewOptions *) (relation)->rd_options)->security_barrier : false)
  
@@ -369,16 +369,16 @@ index 509e930fc7..611475f1c2 100644
  
  -- Check that unknown literals are converted to "text" in CREATE VIEW,
  -- so that we don't end up with unknown-type columns.
-@@ -2010,7 +2035,7 @@ drop cascades to view aliased_view_2
+@@ -2044,7 +2069,7 @@ drop cascades to view aliased_view_2
  drop cascades to view aliased_view_3
  drop cascades to view aliased_view_4
  DROP SCHEMA testviewschm2 CASCADE;
--NOTICE:  drop cascades to 74 other objects
-+NOTICE:  drop cascades to 77 other objects
+-NOTICE:  drop cascades to 75 other objects
++NOTICE:  drop cascades to 78 other objects
  DETAIL:  drop cascades to table t1
  drop cascades to view temporal1
  drop cascades to view temporal2
-@@ -2031,6 +2056,9 @@ drop cascades to view mysecview1
+@@ -2065,6 +2090,9 @@ drop cascades to view mysecview1
  drop cascades to view mysecview2
  drop cascades to view mysecview3
  drop cascades to view mysecview4
@@ -740,7 +740,7 @@ index 89397e41f0..d32a40ede3 100644
  SET SESSION AUTHORIZATION regress_rls_bob;
  DROP VIEW rls_view;
  --
-@@ -3987,7 +4241,7 @@ RESET SESSION AUTHORIZATION;
+@@ -4051,7 +4305,7 @@ RESET SESSION AUTHORIZATION;
  --
  RESET SESSION AUTHORIZATION;
  DROP SCHEMA regress_rls_schema CASCADE;
@@ -749,7 +749,7 @@ index 89397e41f0..d32a40ede3 100644
  DETAIL:  drop cascades to function f_leak(text)
  drop cascades to table uaccount
  drop cascades to table category
-@@ -4005,6 +4259,7 @@ drop cascades to table b1
+@@ -4069,6 +4323,7 @@ drop cascades to table b1
  drop cascades to view bv1
  drop cascades to table z1
  drop cascades to table z2
@@ -761,7 +761,7 @@ diff --git a/src/test/regress/expected/rules.out b/src/test/regress/expected/rul
 index 2fa00a3c29..be12666ecb 100644
 --- a/src/test/regress/expected/rules.out
 +++ b/src/test/regress/expected/rules.out
-@@ -3699,3 +3699,33 @@ SELECT * FROM ruletest2;
+@@ -3750,3 +3750,33 @@ SELECT * FROM ruletest2;
  
  DROP TABLE ruletest1;
  DROP TABLE ruletest2;
@@ -799,7 +799,7 @@ diff --git a/src/test/regress/expected/updatable_views.out b/src/test/regress/ex
 index cdff914b93..d57eeb761c 100644
 --- a/src/test/regress/expected/updatable_views.out
 +++ b/src/test/regress/expected/updatable_views.out
-@@ -979,6 +979,7 @@ drop cascades to function rw_view1_aa(rw_view1)
+@@ -1001,6 +1001,7 @@ drop cascades to function rw_view1_aa(rw_view1)
  -- permissions checks
  CREATE USER regress_view_user1;
  CREATE USER regress_view_user2;
@@ -807,7 +807,7 @@ index cdff914b93..d57eeb761c 100644
  SET SESSION AUTHORIZATION regress_view_user1;
  CREATE TABLE base_tbl(a int, b text, c float);
  INSERT INTO base_tbl VALUES (1, 'Row 1', 1.0);
-@@ -1205,8 +1206,244 @@ DROP TABLE base_tbl CASCADE;
+@@ -1227,8 +1228,244 @@ DROP TABLE base_tbl CASCADE;
  NOTICE:  drop cascades to 2 other objects
  DETAIL:  drop cascades to view rw_view1
  drop cascades to view rw_view2
@@ -1297,7 +1297,7 @@ diff --git a/src/test/regress/sql/rules.sql b/src/test/regress/sql/rules.sql
 index b732833e63..b5e8ab113c 100644
 --- a/src/test/regress/sql/rules.sql
 +++ b/src/test/regress/sql/rules.sql
-@@ -1257,3 +1257,31 @@ SELECT * FROM ruletest2;
+@@ -1288,3 +1288,31 @@ SELECT * FROM ruletest2;
  
  DROP TABLE ruletest1;
  DROP TABLE ruletest2;
@@ -1333,7 +1333,7 @@ diff --git a/src/test/regress/sql/updatable_views.sql b/src/test/regress/sql/upd
 index 09328e582b..fa206a8fe7 100644
 --- a/src/test/regress/sql/updatable_views.sql
 +++ b/src/test/regress/sql/updatable_views.sql
-@@ -410,6 +410,7 @@ DROP TABLE base_tbl CASCADE;
+@@ -427,6 +427,7 @@ DROP TABLE base_tbl CASCADE;
  
  CREATE USER regress_view_user1;
  CREATE USER regress_view_user2;
@@ -1341,7 +1341,7 @@ index 09328e582b..fa206a8fe7 100644
  
  SET SESSION AUTHORIZATION regress_view_user1;
  CREATE TABLE base_tbl(a int, b text, c float);
-@@ -552,8 +553,187 @@ RESET SESSION AUTHORIZATION;
+@@ -569,8 +570,187 @@ RESET SESSION AUTHORIZATION;
  
  DROP TABLE base_tbl CASCADE;
  
