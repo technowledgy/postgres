@@ -7,14 +7,14 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.3.0
+      - uses: actions/checkout@v5.0.0
       - name: Shellcheck
         run: docker compose run --rm shellcheck build.sh
 
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.3.0
+      - uses: actions/checkout@v5.0.0
         with:
           submodules: recursive
       - name: Patch Dockerfile
